@@ -1,34 +1,24 @@
-# Google Sheets setup
+# Connect Google Sheets
 
-The browser talks only to `/api/records`. Google credentials stay in the server environment and are never sent to browser code.
+This uses a small Apps Script attached to your spreadsheet. You do not need to create a Google Cloud service account or download a JSON key.
 
-## 1. Prepare the spreadsheet
+## One-time setup
 
-1. Create or choose a Google spreadsheet.
-2. Create a worksheet tab named **Calculations**. The app writes its header row automatically when this tab is empty.
-3. Copy the spreadsheet ID from the URL. It is the text between `/d/` and `/edit`.
+1. Open the Google spreadsheet you want to use.
+2. Choose **Extensions → Apps Script**.
+3. Replace the editor contents with [`apps-script/Code.gs`](apps-script/Code.gs), then save the project.
+4. In Apps Script, open **Project Settings** (gear icon) → **Script Properties** → **Add script property**. Set the property name to `APP_ACCESS_KEY` and its value to a long random password. Keep it private.
+5. Click **Deploy → New deployment**, choose **Web app**, set **Execute as** to **Me**, and allow access to **Anyone** if that option is available for your account. Click **Deploy** and approve the requested Google access.
+6. Copy the deployment URL ending in `/exec`.
+7. In Vercel, open **Project → Settings → Environment Variables** and add:
+   - `GOOGLE_APPS_SCRIPT_URL` = the `/exec` deployment URL
+   - `APP_ACCESS_KEY` = the exact same password you set in Script Properties
+8. Redeploy the Vercel project. The first connection creates a `Calculations` tab automatically.
 
-## 2. Create server credentials
+For local preview, copy `.env.example` to `.env.local`, set those same two values, restart `npm start`, enter the shared password in the app, and press **Connect**.
 
-1. In Google Cloud Console, create or choose a project and enable the **Google Sheets API**.
-2. Create a service account and a JSON key for it.
-3. Share the spreadsheet with the service account email from the JSON file and give it **Editor** access.
+## How data is stored
 
-The API uses a server-to-server service account token with the Sheets scope. Do not commit the JSON key or place it in client-side code.
+The spreadsheet holds one row per saved term: record ID, save time, term, semester GPA, GPA credits, and course details as JSON. Loading a saved term and saving it again updates that row.
 
-## 3. Configure the app
-
-Set these environment variables in Vercel under **Project → Settings → Environment Variables**, then redeploy:
-
-- `GOOGLE_SHEETS_ID`: spreadsheet ID
-- `GOOGLE_SERVICE_ACCOUNT_EMAIL`: service account `client_email`
-- `GOOGLE_PRIVATE_KEY`: service account `private_key`; keep it server-side. If entering it as one line, preserve newlines as literal `\n` sequences.
-- `APP_ACCESS_KEY`: a long random shared password for access to this shared spreadsheet
-
-For local preview, copy `.env.example` to `.env.local` and replace the values. `.env.local` is ignored by Git. Restart `npm start`, open the app, enter `APP_ACCESS_KEY` in the connection panel, and choose **Connect**.
-
-## Data and access model
-
-All visitors who know the same shared access key see and can update the same spreadsheet records. This is a small shared-record prototype; it does not provide Google sign-in or separate per-student accounts. Do not store sensitive student information in this shared setup.
-
-The **Calculations** tab stores one row per saved term: record ID, save time, term, semester GPA, GPA credits, and the course details as JSON. Saving a loaded record updates that row; saving a new term adds a row.
+All people using the shared access key can read and update the same records. This setup does not provide Google sign-in or separate per-student accounts. Use it as a private shared calculator and avoid storing sensitive student information. Google Apps Script web apps run with the chosen deployment identity and access setting; see Google's [web app deployment guide](https://developers.google.com/apps-script/guides/web).

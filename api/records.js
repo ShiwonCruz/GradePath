@@ -1,11 +1,5 @@
 const crypto = require('node:crypto');
-
-const SHEET_NAME = 'Calculations';
-const SHEET_RANGE = `${SHEET_NAME}!A:F`;
-const HEADERS = ['Record ID', 'Saved At (UTC)', 'Semester / Term', 'Semester GPA', 'GPA Credits', 'Courses JSON'];
 const POINTS = { 'A+':4, A:4, 'A-':3.7, 'B+':3.3, B:3, 'B-':2.7, 'C+':2.3, C:2, 'C-':1.7, 'D+':1.3, D:1, E:0 };
-let cachedToken = null;
-let tokenExpiresAt = 0;
 
 function reply(res, status, payload) {
   if (typeof res.status === 'function' && typeof res.json === 'function') return res.status(status).json(payload);
@@ -14,11 +8,11 @@ function reply(res, status, payload) {
 }
 
 function config() {
-  const { GOOGLE_SHEETS_ID, GOOGLE_SERVICE_ACCOUNT_EMAIL, GOOGLE_PRIVATE_KEY, APP_ACCESS_KEY } = process.env;
-  if (!GOOGLE_SHEETS_ID || !GOOGLE_SERVICE_ACCOUNT_EMAIL || !GOOGLE_PRIVATE_KEY || !APP_ACCESS_KEY) {
-    throw new Error('Google Sheets is not configured. Set GOOGLE_SHEETS_ID, GOOGLE_SERVICE_ACCOUNT_EMAIL, GOOGLE_PRIVATE_KEY, and APP_ACCESS_KEY.');
+  const { GOOGLE_APPS_SCRIPT_URL, APP_ACCESS_KEY } = process.env;
+  if (!GOOGLE_APPS_SCRIPT_URL || !APP_ACCESS_KEY) {
+    throw new Error('Google Sheets is not configured. Set GOOGLE_APPS_SCRIPT_URL and APP_ACCESS_KEY.');
   }
-  return { spreadsheetId: GOOGLE_SHEETS_ID, email: GOOGLE_SERVICE_ACCOUNT_EMAIL, privateKey: GOOGLE_PRIVATE_KEY.replace(/\\n/g, '\n'), appKey: APP_ACCESS_KEY };
+  return { scriptUrl: GOOGLE_APPS_SCRIPT_URL, appKey: APP_ACCESS_KEY };
 }
 
 function authorized(req, expected) {
@@ -28,60 +22,17 @@ function authorized(req, expected) {
   return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 
-function base64url(value) { return Buffer.from(value).toString('base64').replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_'); }
-
-async function googleToken({ email, privateKey }) {
-  const now = Math.floor(Date.now() / 1000);
-  if (cachedToken && tokenExpiresAt > now + 60) return cachedToken;
-  const header = base64url(JSON.stringify({ alg: 'RS256', typ: 'JWT' }));
-  const claims = base64url(JSON.stringify({ iss: email, scope: 'https://www.googleapis.com/auth/spreadsheets', aud: 'https://oauth2.googleapis.com/token', iat: now, exp: now + 3600 }));
-  const unsigned = `${header}.${claims}`;
-  const signature = crypto.sign('RSA-SHA256', Buffer.from(unsigned), privateKey).toString('base64').replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
-  const assertion = `${unsigned}.${signature}`;
-  const response = await fetch('https://oauth2.googleapis.com/token', {
-    method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({ grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer', assertion })
-  });
-  const data = await response.json();
-  if (!response.ok) throw new Error(data.error_description || data.error || 'Google authentication failed.');
-  cachedToken = data.access_token;
-  tokenExpiresAt = now + Number(data.expires_in || 3600);
-  return cachedToken;
-}
-
-async function sheetsRequest(method, path, body, cfg) {
-  const token = await googleToken(cfg);
-  const url = `https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(cfg.spreadsheetId)}/${path}`;
+async function appsScriptRequest(cfg, method, record) {
+  const url = new URL(cfg.scriptUrl);
+  if (method === 'GET') url.searchParams.set('key', cfg.appKey);
   const response = await fetch(url, {
     method,
-    headers: { Authorization: `Bearer ${token}`, ...(body ? { 'Content-Type': 'application/json' } : {}) },
-    ...(body ? { body: JSON.stringify(body) } : {})
+    headers: method === 'POST' ? { 'Content-Type': 'application/json' } : undefined,
+    ...(method === 'POST' ? { body: JSON.stringify({ key: cfg.appKey, record }) } : {})
   });
-  const data = await response.json().catch(() => ({}));
-  if (!response.ok) {
-    const message = data.error && data.error.message;
-    throw new Error(`Google Sheets API (${response.status}): ${message || 'request failed'}`);
-  }
+  const data = await response.json().catch(() => null);
+  if (!response.ok || !data || data.ok === false) throw new Error(data && data.error || `Apps Script request failed (${response.status}).`);
   return data;
-}
-
-async function readRows(cfg) {
-  const path = `values/${encodeURIComponent(SHEET_RANGE)}?majorDimension=ROWS`;
-  const data = await sheetsRequest('GET', path, null, cfg);
-  const rows = data.values || [];
-  if (!rows.length) {
-    await sheetsRequest('PUT', `values/${encodeURIComponent(`${SHEET_NAME}!A1:F1`)}?valueInputOption=RAW`, { values: [HEADERS] }, cfg);
-    return [];
-  }
-  return rows.slice(1).map((row, index) => ({
-    id: row[0] || '', savedAt: row[1] || '', term: row[2] || '', gpa: Number(row[3] || 0), credits: Number(row[4] || 0),
-    courses: parseCourses(row[5]), rowNumber: index + 2
-  })).filter(record => record.id);
-}
-
-function parseCourses(value) {
-  try { const parsed = JSON.parse(value || '[]'); return Array.isArray(parsed) ? parsed : []; }
-  catch { return []; }
 }
 
 function calculateRecord(record) {
@@ -127,26 +78,17 @@ module.exports = async function records(req, res) {
 
   try {
     if (req.method === 'GET') {
-      const records = await readRows(cfg);
-      records.sort((a, b) => String(b.savedAt).localeCompare(String(a.savedAt)));
-      return reply(res, 200, { records: records.map(({ rowNumber, ...record }) => record) });
+      const data = await appsScriptRequest(cfg, 'GET');
+      return reply(res, 200, { records: data.records || [] });
     }
     const body = await readBody(req);
     const record = calculateRecord(body.record);
-    const existing = (await readRows(cfg)).find(item => item.id === record.id);
-    const row = [record.id, record.savedAt, record.term, record.gpa, record.credits, JSON.stringify(record.courses)];
-    if (existing) {
-      const target = `${SHEET_NAME}!A${existing.rowNumber}:F${existing.rowNumber}`;
-      await sheetsRequest('PUT', `values/${encodeURIComponent(target)}?valueInputOption=RAW`, { values: [row] }, cfg);
-    } else {
-      await sheetsRequest('POST', `values/${encodeURIComponent(SHEET_RANGE)}:append?valueInputOption=RAW&insertDataOption=INSERT_ROWS`, { values: [row] }, cfg);
-    }
-    return reply(res, 200, { record });
+    const data = await appsScriptRequest(cfg, 'POST', record);
+    return reply(res, 200, { record: data.record || record });
   } catch (error) {
     console.error('Google Sheets records error:', error.message);
-    const message = error.message.startsWith('Google Sheets API') || error.message.includes('Google authentication')
-      ? 'Google Sheets could not be reached. Check that the Sheets API is enabled, the spreadsheet is shared with the service account, and the Calculations tab exists.'
-      : error.message;
+    const message = error.message.startsWith('Apps Script request failed')
+      ? 'The Google Sheets script could not be reached. Check its deployment URL and access settings.' : error.message;
     return reply(res, 500, { error: message });
   }
 };
